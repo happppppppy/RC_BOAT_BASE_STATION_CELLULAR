@@ -120,6 +120,22 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             .serverPort(brokerPort)
             .sslWithDefaultConfig()
             .automaticReconnectWithDefaultConfig()
+            .addConnectedListener {
+                viewModelScope.launch {
+                    _mqttStatus.value = "Connected"
+                    subscribeToSignaling()
+                    // Proactively initiate the call as soon as we connect
+                    initiateWebRTC()
+                }
+            }
+            .addDisconnectedListener {
+                viewModelScope.launch {
+                    _mqttStatus.value = "Disconnected"
+                    isDataChannelOpen = false
+                    commandPublishJob?.cancel()
+                    cleanupWebRTC()
+                }
+            }
             .buildAsync()
 
         mqttClient?.connectWith()
@@ -132,10 +148,6 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                 viewModelScope.launch {
                     if (throwable != null) {
                         _mqttStatus.value = "Failed: ${throwable.message}"
-                    } else {
-                        _mqttStatus.value = "Connected"
-                        subscribeToSignaling()
-                        initiateWebRTC()
                     }
                 }
             }
@@ -159,7 +171,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun startCommandPublishing() {
         commandPublishJob?.cancel()
-        commandPublishJob = viewModelScope.launch {
+        commandPublishJob = viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 val power = (kotlin.math.abs(throttle) * 100).toInt()
                 val direction = if (throttle > 0.1) 1 else if (throttle < -0.1) -1 else 0
@@ -195,6 +207,10 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                     Log.d("WebRTC_Signaling", "Received message: $message")
                     val json = JSONObject(message)
                     when {
+                        json.has("type") && json.getString("type") == "hello" -> {
+                            Log.d("WebRTC_Signaling", "Received HELLO from boat, initiating call.")
+                            initiateWebRTC()
+                        }
                         json.has("sdp") -> {
                             val sdp = json.getString("sdp")
                             val type = SessionDescription.Type.fromCanonicalForm(json.getString("type").lowercase())
@@ -226,6 +242,8 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun initiateWebRTC() {
+        cleanupWebRTC()
+
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("turn:numb.viagenie.ca:3478")
@@ -238,6 +256,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate?) {
                 candidate?.let {
+                    Log.d("WebRTC_Signaling", "Generated local ICE Candidate")
                     val json = JSONObject().apply {
                         put("candidate", it.sdp)
                         put("sdpMid", it.sdpMid)
@@ -304,6 +323,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 peerConnection?.setLocalDescription(object: SdpObserverAdapter() {
                     override fun onSetSuccess() {
+                        Log.d("WebRTC_Signaling", "Set local description (offer) success")
                         sdp?.let {
                             val json = JSONObject().apply {
                                 put("type", it.type.canonicalForm())
@@ -312,19 +332,36 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                             sendSignalingMessage(json)
                         }
                     }
+                    override fun onSetFailure(error: String?) {
+                        Log.e("WebRTC_Signaling", "Failed to set local description: $error")
+                    }
                 }, sdp)
+            }
+            override fun onCreateFailure(error: String?) {
+                Log.e("WebRTC_Signaling", "Failed to create offer: $error")
             }
         }, MediaConstraints())
     }
 
-    fun disconnectMqtt() {
-        sendSignalingMessage(JSONObject().put("type", "bye"))
+    private fun cleanupWebRTC() {
+        Log.d("WebRTC_Signaling", "Cleaning up WebRTC connection...")
         commandPublishJob?.cancel()
         peerConnection?.close()
         peerConnection = null
+        controlDataChannel?.close()
+        controlDataChannel = null
+        telemetryDataChannel?.close()
+        telemetryDataChannel = null
+        isDataChannelOpen = false
+        viewModelScope.launch(Dispatchers.Main) {
+            _videoTrack.value = null
+        }
+    }
+
+    fun disconnectMqtt() {
+        sendSignalingMessage(JSONObject().put("type", "bye"))
+        cleanupWebRTC()
         mqttClient?.disconnect()
-        mqttClient = null
-        _mqttStatus.value = "Disconnected"
     }
 
     override fun onCleared() {
@@ -391,22 +428,26 @@ fun VideoView(videoTrack: VideoTrack?, eglBaseContext: EglBase.Context?, modifie
     val context = LocalContext.current
     val surfaceViewRenderer = remember { SurfaceViewRenderer(context) }
 
-    LaunchedEffect(Unit) {
-        surfaceViewRenderer.init(eglBaseContext, null)
-        surfaceViewRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-        surfaceViewRenderer.setEnableHardwareScaler(true)
-        surfaceViewRenderer.setZOrderMediaOverlay(true)
+    DisposableEffect(eglBaseContext) {
+        if (eglBaseContext != null) {
+            surfaceViewRenderer.init(eglBaseContext, null)
+            surfaceViewRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+            surfaceViewRenderer.setEnableHardwareScaler(true)
+            surfaceViewRenderer.setZOrderMediaOverlay(true)
+        }
+        onDispose {
+            surfaceViewRenderer.release()
+        }
     }
 
     DisposableEffect(videoTrack) {
         videoTrack?.addSink(surfaceViewRenderer)
         onDispose {
             videoTrack?.removeSink(surfaceViewRenderer)
-            surfaceViewRenderer.release()
         }
     }
 
-    AndroidView(factory = { surfaceViewRenderer }, modifier = modifier)
+    AndroidView({ surfaceViewRenderer }, modifier = modifier)
 }
 
 
@@ -541,3 +582,4 @@ open class SdpObserverAdapter : SdpObserver {
     override fun onCreateFailure(p0: String?) {}
     override fun onSetFailure(p0: String?) {}
 }
+
