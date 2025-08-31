@@ -153,21 +153,22 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             }
     }
 
-    private fun updateTelemetry(topic: String, payload: String) {
-        viewModelScope.launch {
+    private fun updateTelemetry(key: String, payload: String) {
+        viewModelScope.launch(Dispatchers.Main) {
             val currentData = _telemetryData.value
-            _telemetryData.value = when {
-                topic.endsWith("voltage") -> currentData.copy(boatVoltage = "$payload V")
-                topic.endsWith("tacho") -> currentData.copy(boatTacho = "$payload RPM")
-                topic.endsWith("battery") -> currentData.copy(phoneBattery = "$payload%")
-                topic.endsWith("signal") -> currentData.copy(phoneSignal = "Level: $payload/4")
-                topic.endsWith("network_type") -> currentData.copy(phoneNetworkType = payload)
-                topic.endsWith("gps") -> currentData.copy(phoneGps = payload)
-                topic.endsWith("compass") -> currentData.copy(phoneHeading = "$payload°")
+            _telemetryData.value = when (key) {
+                "stm32:voltage" -> currentData.copy(boatVoltage = "$payload V")
+                "stm32:tacho" -> currentData.copy(boatTacho = "$payload RPM")
+                "phone:battery" -> currentData.copy(phoneBattery = "$payload%")
+                "phone:signal" -> currentData.copy(phoneSignal = "Level: $payload/4")
+                "phone:network_type" -> currentData.copy(phoneNetworkType = payload)
+                "phone:gps" -> currentData.copy(phoneGps = payload)
+                "phone:compass" -> currentData.copy(phoneHeading = "$payload°")
                 else -> currentData
             }
         }
     }
+
 
     private fun startCommandPublishing() {
         commandPublishJob?.cancel()
@@ -207,9 +208,8 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                     Log.d("WebRTC_Signaling", "Received message: $message")
                     val json = JSONObject(message)
                     when {
-                        json.has("type") && json.getString("type") == "hello" -> {
-                            Log.d("WebRTC_Signaling", "Received HELLO from boat, initiating call.")
-                            initiateWebRTC()
+                        json.has("type") && json.getString("type") == "bye" -> {
+                            cleanupWebRTC()
                         }
                         json.has("sdp") -> {
                             val sdp = json.getString("sdp")
@@ -246,8 +246,11 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
 
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("turn:numb.viagenie.ca:3478")
-                .setUsername("webrtc@live.com").setPassword("muazkh").createIceServer()
+            // Using Twilio credentials from BuildConfig
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
+                .setUsername(BuildConfig.TURN_USERNAME)
+                .setPassword(BuildConfig.TURN_PASSWORD)
+                .createIceServer()
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
