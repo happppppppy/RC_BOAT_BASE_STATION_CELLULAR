@@ -20,6 +20,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -75,6 +76,9 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     private val _mqttStatus = MutableStateFlow("Disconnected")
     val mqttStatus = _mqttStatus.asStateFlow()
 
+    private val _webRtcStatus = MutableStateFlow("Idle")
+    val webRtcStatus = _webRtcStatus.asStateFlow()
+
     private val _telemetryData = MutableStateFlow(TelemetryData())
     val telemetryData = _telemetryData.asStateFlow()
 
@@ -88,6 +92,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     private val mqttPassword = BuildConfig.MQTT_PASSWORD
     private val signalingOutTopic = "rcboat/signaling/base_to_boat"
     private val signalingInTopic = "rcboat/signaling/boat_to_base"
+    private val statusTopic = "rcboat/status"
     private var mqttClient: Mqtt5AsyncClient? = null
     private var commandPublishJob: Job? = null
 
@@ -123,8 +128,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             .addConnectedListener {
                 viewModelScope.launch {
                     _mqttStatus.value = "Connected"
-                    subscribeToSignaling()
-                    // Proactively initiate the call as soon as we connect
+                    subscribeToTopics()
                     initiateWebRTC()
                 }
             }
@@ -144,7 +148,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             ?.password(mqttPassword.toByteArray())
             ?.applySimpleAuth()
             ?.send()
-            ?.whenComplete { _, throwable ->
+            ?.whenComplete { _, throwable: Throwable? ->
                 viewModelScope.launch {
                     if (throwable != null) {
                         _mqttStatus.value = "Failed: ${throwable.message}"
@@ -168,7 +172,6 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             }
         }
     }
-
 
     private fun startCommandPublishing() {
         commandPublishJob?.cancel()
@@ -199,7 +202,8 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     fun updateThrottle(value: Float) { throttle = value }
     fun updateSteering(value: Float) { steering = value }
 
-    private fun subscribeToSignaling() {
+    private fun subscribeToTopics() {
+        // Signaling Topic
         mqttClient?.subscribeWith()
             ?.topicFilter(signalingInTopic)
             ?.callback { publish ->
@@ -232,6 +236,20 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                 }
             }
             ?.send()
+
+        // Gateway Status Topic
+        mqttClient?.subscribeWith()
+            ?.topicFilter(statusTopic)
+            ?.callback { publish ->
+                if (publish.payload.isPresent) {
+                    val status = StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
+                    if (status == "online") {
+                        Log.d("BaseStation", "Gateway came online, initiating WebRTC call.")
+                        initiateWebRTC()
+                    }
+                }
+            }
+            ?.send()
     }
 
     private fun sendSignalingMessage(message: JSONObject) {
@@ -243,10 +261,10 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun initiateWebRTC() {
         cleanupWebRTC()
+        _webRtcStatus.value = "Initiating..."
 
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            // Using Twilio credentials from BuildConfig
             PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
                 .setUsername(BuildConfig.TURN_USERNAME)
                 .setPassword(BuildConfig.TURN_PASSWORD)
@@ -295,8 +313,17 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                     }
                 })
             }
+            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    _webRtcStatus.value = newState?.name ?: "UNKNOWN"
+                    // Only clean up on permanent failure, not temporary disconnects
+                    if (newState == PeerConnection.IceConnectionState.FAILED || newState == PeerConnection.IceConnectionState.CLOSED) {
+                        cleanupWebRTC()
+                    }
+                }
+            }
+
             override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
-            override fun onIceConnectionChange(p0: PeerConnection.IceConnectionState?) {}
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState?) {}
             override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
@@ -306,6 +333,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         })
 
         peerConnection?.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY))
+        peerConnection?.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY))
 
         controlDataChannel = peerConnection?.createDataChannel("control", DataChannel.Init())
         controlDataChannel?.registerObserver(object : DataChannel.Observer {
@@ -358,6 +386,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         isDataChannelOpen = false
         viewModelScope.launch(Dispatchers.Main) {
             _videoTrack.value = null
+            _webRtcStatus.value = "Idle"
         }
     }
 
@@ -379,37 +408,41 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
 @Composable
 fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
     val mqttStatus by viewModel.mqttStatus.collectAsState()
+    val webRtcStatus by viewModel.webRtcStatus.collectAsState()
     val telemetryData by viewModel.telemetryData.collectAsState()
     val videoTrack by viewModel.videoTrack.collectAsState()
+    val isConnected = webRtcStatus == "CONNECTED"
 
     Box(modifier = Modifier.fillMaxSize()) {
-        VideoView(videoTrack, viewModel.eglBaseContext, modifier = Modifier.fillMaxSize())
+        VideoView(
+            videoTrack = videoTrack,
+            eglBaseContext = viewModel.eglBaseContext,
+            modifier = Modifier.fillMaxSize()
+        )
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
+            // Top Bar: Title and Connection Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(
-                    "Base Station",
-                    style = MaterialTheme.typography.headlineLarge,
-                    color = Color.White
-                )
+                Text("Base Station", style = MaterialTheme.typography.headlineLarge, color = Color.White)
                 Button(onClick = {
                     if (mqttStatus == "Connected") viewModel.disconnectMqtt() else viewModel.connectMqtt()
                 }) {
                     Text(if (mqttStatus == "Connected") "Disconnect" else "Connect")
                 }
             }
-            Text(
-                "MQTT Status: $mqttStatus",
-                color = if (mqttStatus == "Connected") Color.Green else Color.LightGray,
-                fontSize = 14.sp
-            )
+
+            // Status Texts
+            Text("MQTT: $mqttStatus", color = if (mqttStatus == "Connected") Color.Green else Color.LightGray, fontSize = 14.sp)
+            Text("WebRTC: $webRtcStatus", color = if (isConnected) Color.Green else Color.LightGray, fontSize = 14.sp)
+
+            // Main Content Area
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -417,13 +450,14 @@ fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                ThrottleSlider(onMove = { viewModel.updateThrottle(it) })
+                ThrottleSlider(onMove = { viewModel.updateThrottle(it) }, enabled = isConnected)
                 TelemetryDashboard(data = telemetryData)
-                SteeringSlider(onMove = { viewModel.updateSteering(it) })
+                SteeringSlider(onMove = { viewModel.updateSteering(it) }, enabled = isConnected)
             }
         }
     }
 }
+
 
 // --- UI: Video View ---
 @Composable
@@ -431,7 +465,7 @@ fun VideoView(videoTrack: VideoTrack?, eglBaseContext: EglBase.Context?, modifie
     val context = LocalContext.current
     val surfaceViewRenderer = remember { SurfaceViewRenderer(context) }
 
-    DisposableEffect(eglBaseContext) {
+    DisposableEffect(key1 = Unit) {
         if (eglBaseContext != null) {
             surfaceViewRenderer.init(eglBaseContext, null)
             surfaceViewRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
@@ -443,6 +477,7 @@ fun VideoView(videoTrack: VideoTrack?, eglBaseContext: EglBase.Context?, modifie
         }
     }
 
+    // This effect runs whenever the videoTrack changes
     DisposableEffect(videoTrack) {
         videoTrack?.addSink(surfaceViewRenderer)
         onDispose {
@@ -450,11 +485,19 @@ fun VideoView(videoTrack: VideoTrack?, eglBaseContext: EglBase.Context?, modifie
         }
     }
 
-    AndroidView({ surfaceViewRenderer }, modifier = modifier)
+    if (videoTrack != null) {
+        AndroidView({ surfaceViewRenderer }, modifier = modifier)
+    } else {
+        Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Video Disconnected", color = Color.White)
+            }
+        }
+    }
 }
 
-
-// --- Other UI Composables (TelemetryDashboard, Sliders, etc.)
 @Composable
 fun TelemetryDashboard(data: TelemetryData) {
     Card(
@@ -476,8 +519,8 @@ fun TelemetryDashboard(data: TelemetryData) {
 }
 
 @Composable
-fun ThrottleSlider(modifier: Modifier = Modifier, onMove: (Float) -> Unit) {
-    var sliderPosition by remember { mutableFloatStateOf(0f) } // This is in pixels
+fun ThrottleSlider(modifier: Modifier = Modifier, enabled: Boolean, onMove: (Float) -> Unit) {
+    var sliderPosition by remember { mutableFloatStateOf(0f) }
     val sliderHeight = 250.dp
     val sliderWidth = 80.dp
     val density = LocalDensity.current
@@ -486,12 +529,14 @@ fun ThrottleSlider(modifier: Modifier = Modifier, onMove: (Float) -> Unit) {
     val thumbHeightPx = with(density) { 40.dp.toPx() }
     val trackCornerRadiusPx = with(density) { 10.dp.toPx() }
     val thumbCornerRadiusPx = with(density) { 5.dp.toPx() }
+    val thumbColor = if (enabled) Color.DarkGray else Color.Gray.copy(alpha = 0.5f)
 
     Box(
         modifier = modifier
             .height(sliderHeight)
             .width(sliderWidth)
-            .pointerInput(Unit) {
+            .pointerInput(enabled) {
+                if (!enabled) return@pointerInput
                 detectDragGestures(
                     onDragStart = { },
                     onDragEnd = {
@@ -507,7 +552,6 @@ fun ThrottleSlider(modifier: Modifier = Modifier, onMove: (Float) -> Unit) {
                         val newY = sliderPosition + dragAmount.y
                         val maxHeightPx = size.height / 2f
                         sliderPosition = newY.coerceIn(-maxHeightPx, maxHeightPx)
-                        // Normalize to -1 (bottom) to 1 (top)
                         onMove(-sliderPosition / maxHeightPx)
                     }
                 )
@@ -521,7 +565,7 @@ fun ThrottleSlider(modifier: Modifier = Modifier, onMove: (Float) -> Unit) {
                 cornerRadius = CornerRadius(trackCornerRadiusPx)
             )
             drawRoundRect(
-                color = Color.DarkGray,
+                color = thumbColor,
                 topLeft = Offset(center.x - (thumbHeightPx / 2), center.y + sliderPosition - (thumbHeightPx / 2)),
                 size = Size(thumbHeightPx, thumbHeightPx),
                 cornerRadius = CornerRadius(thumbCornerRadiusPx)
@@ -531,13 +575,14 @@ fun ThrottleSlider(modifier: Modifier = Modifier, onMove: (Float) -> Unit) {
 }
 
 @Composable
-fun SteeringSlider(modifier: Modifier = Modifier, onMove: (Float) -> Unit) {
+fun SteeringSlider(modifier: Modifier = Modifier, enabled: Boolean, onMove: (Float) -> Unit) {
     var sliderPosition by remember { mutableFloatStateOf(0f) }
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Steering: ${(sliderPosition * 45).toInt()}°", color = Color.White)
         Slider(
             value = sliderPosition,
+            enabled = enabled,
             onValueChange = {
                 sliderPosition = it
                 onMove(it)
@@ -558,10 +603,11 @@ fun TelemetryRow(label: String, value: String) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, fontWeight = FontWeight.Bold, color = Color.White)
-        Text(value, fontSize = 14.sp, color = Color.White)
+        Text(label, fontWeight = FontWeight.Bold, color = Color.White, fontSize = 14.sp)
+        Text(value, fontSize = 14.sp, color = Color.White, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
     }
 }
 
@@ -578,7 +624,6 @@ fun BaseStationTheme(content: @Composable () -> Unit) {
     )
 }
 
-// SdpObserver adapter to simplify callbacks
 open class SdpObserverAdapter : SdpObserver {
     override fun onCreateSuccess(p0: SessionDescription?) {}
     override fun onSetSuccess() {}
