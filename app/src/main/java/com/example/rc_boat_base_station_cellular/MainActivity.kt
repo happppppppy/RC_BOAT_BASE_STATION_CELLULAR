@@ -247,8 +247,24 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("turn:numb.viagenie.ca:3478")
-                .setUsername("webrtc@live.com").setPassword("muazkh").createIceServer()
-        )
+                .setUsername("webrtc@live.com")
+                .setPassword("muazkh")
+                .createIceServer(),
+            PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478").createIceServer(),
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
+                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
+                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
+                .createIceServer(),
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=tcp")
+                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
+                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
+                .createIceServer(),
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:443?transport=tcp")
+                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
+                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
+                .createIceServer(),
+
+            )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
         }
