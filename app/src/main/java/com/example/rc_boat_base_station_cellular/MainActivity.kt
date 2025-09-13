@@ -28,8 +28,10 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hivemq.client.mqtt.MqttClient
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -81,6 +83,9 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     private val _videoTrack = MutableStateFlow<VideoTrack?>(null)
     val videoTrack = _videoTrack.asStateFlow()
 
+    private val _videoStatus = MutableStateFlow("Disconnected")
+    val videoStatus = _videoStatus.asStateFlow()
+
     // --- MQTT Handling ---
     private val brokerHost = BuildConfig.MQTT_BROKER_HOST
     private val brokerPort = 8883
@@ -88,6 +93,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     private val mqttPassword = BuildConfig.MQTT_PASSWORD
     private val signalingOutTopic = "rcboat/signaling/base_to_boat"
     private val signalingInTopic = "rcboat/signaling/boat_to_base"
+    private val generalTopic = "rcboat/general"
     private var mqttClient: Mqtt5AsyncClient? = null
     private var commandPublishJob: Job? = null
 
@@ -241,8 +247,17 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    private fun sendGeneralMessage(message: JSONObject) {
+        Log.d("MQTT_General_Message", "Sending message: $message")
+        if (mqttClient?.state?.isConnected == true) {
+            mqttClient?.publishWith()?.topic(generalTopic)?.payload(message.toString().toByteArray())?.send()
+        }
+    }
+
     private fun initiateWebRTC() {
-        cleanupWebRTC()
+        if (peerConnection?.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
+            cleanupWebRTC()
+        }
 
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -287,6 +302,7 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                         viewModelScope.launch(Dispatchers.Main) {
                             _videoTrack.value = track
                         }
+                        _videoStatus.value = "Connected"
                     }
                 }
             }
@@ -359,19 +375,76 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         }, MediaConstraints())
     }
 
+    private val cleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     private fun cleanupWebRTC() {
-        Log.d("WebRTC_Signaling", "Cleaning up WebRTC connection...")
-        commandPublishJob?.cancel()
-        peerConnection?.close()
-        peerConnection = null
-        controlDataChannel?.close()
-        controlDataChannel = null
-        telemetryDataChannel?.close()
-        telemetryDataChannel = null
-        isDataChannelOpen = false
-        viewModelScope.launch(Dispatchers.Main) {
-            _videoTrack.value = null
+        Log.d(TAG, "Performing actual WebRTC resource release on thread: ${Thread.currentThread().name}")
+        try {
+            controlDataChannel?.unregisterObserver()
+            telemetryDataChannel?.unregisterObserver()
+
+            Log.d(TAG, "Closing control data channel...")
+            controlDataChannel?.close()
+            Log.d(TAG, "Closing telemetry data channel...")
+            telemetryDataChannel?.close()
+
+            commandPublishJob?.cancel()
+
+            // Dispatch peerConnection.close() to a different thread
+            val pc = peerConnection // Capture for use in coroutine
+            if (pc != null) {
+                Log.d(TAG, "Dispatching peerConnection.close() to background thread...")
+                cleanupScope.launch { // Launch on IO dispatcher
+                    try {
+                        Log.d(TAG, "Attempting peerConnection.close() on thread: ${Thread.currentThread().name}")
+                        pc.close()
+                        Log.i(TAG, "Peer connection closed successfully (from background thread).")
+                        // Proceed with nullifying and updating status from this background thread
+                        // or post back to a main/handler thread if UI updates are needed directly from here.
+                        // For now, let's assume further cleanup can happen here.
+                        nullifyWebRTCResourcesAndSignal() // New method for post-close actions
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error during peerConnection.close() in background thread", e)
+                        // Still ensure cleanup finalization happens
+                        nullifyWebRTCResourcesAndSignal()
+                    }
+                }
+                // NOTE: The code after this launch block will execute immediately,
+                // NOT waiting for pc.close() to finish. The 'finally' block below
+                // needs to be rethought if pc.close() is async.
+            } else {
+                Log.d(TAG, "PeerConnection was already null before attempting close.")
+                nullifyWebRTCResourcesAndSignal() // If pc was null, proceed to nullify and signal
+            }
+
+            Log.d(TAG, "Peer connection closed.")
+
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during initial WebRTC cleanup steps (before pc.close dispatch)", e)
+            cleanupScope.launch { nullifyWebRTCResourcesAndSignal() }
+        } finally {
+            peerConnection = null
+            controlDataChannel = null
+            telemetryDataChannel = null
+            isDataChannelOpen = false
+            viewModelScope.launch(Dispatchers.Main) {
+                _videoTrack.value = null
+            }
+
         }
+    }
+
+    private fun nullifyWebRTCResourcesAndSignal() {
+        // This function should be called AFTER peerConnection.close() has completed or failed
+        // Ensure this is thread-safe if called from different contexts, or dispatch to a consistent thread.
+        // For simplicity, assuming it's called from the cleanupScope coroutine or after pc is confirmed null.
+        Log.d(TAG, "Nullifying WebRTC resources and updating status on thread: ${Thread.currentThread().name}")
+        peerConnection = null
+        controlDataChannel = null
+        telemetryDataChannel = null
+        Log.i(TAG, "WebRTC cleanup complete (after nullification and status update).")
     }
 
     fun disconnectMqtt() {
@@ -380,11 +453,31 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
         mqttClient?.disconnect()
     }
 
+    fun toggleVideoFeed() {
+        val json = JSONObject().apply {
+            put("video", if (_videoStatus.value == "Connected") "disable" else "enable")
+        }
+        sendGeneralMessage(json)
+        if (_videoStatus.value == "Connected") {
+            _videoStatus.value = "Disconnected"
+            _videoTrack.value!!.setEnabled(false)
+        } else {
+            _videoStatus.value = "Connected"
+            _videoTrack.value!!.setEnabled(true)
+        }
+
+    }
+
+
     override fun onCleared() {
         disconnectMqtt()
         eglBase.release()
         peerConnectionFactory.dispose()
         super.onCleared()
+    }
+
+    companion object {
+        const val TAG = "BoatBaseStationService"
     }
 }
 
@@ -394,6 +487,7 @@ fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
     val mqttStatus by viewModel.mqttStatus.collectAsState()
     val telemetryData by viewModel.telemetryData.collectAsState()
     val videoTrack by viewModel.videoTrack.collectAsState()
+    val videoStatus by viewModel.videoStatus.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize()) {
         VideoView(videoTrack, viewModel.eglBaseContext, modifier = Modifier.fillMaxSize())
@@ -416,6 +510,9 @@ fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
                     if (mqttStatus == "Connected") viewModel.disconnectMqtt() else viewModel.connectMqtt()
                 }) {
                     Text(if (mqttStatus == "Connected") "Disconnect" else "Connect")
+                }
+                Button(onClick = {viewModel.toggleVideoFeed()}){
+                    Text(if (videoStatus == "Connected") "Disable Video" else "Enable Video")
                 }
             }
             Text(
