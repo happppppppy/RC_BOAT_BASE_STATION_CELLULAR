@@ -17,28 +17,22 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hivemq.client.mqtt.MqttClient
+import com.hivemq.client.mqtt.datatypes.MqttQos
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import org.json.JSONObject
-import org.webrtc.*
-import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
@@ -80,42 +74,17 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
     private val _telemetryData = MutableStateFlow(TelemetryData())
     val telemetryData = _telemetryData.asStateFlow()
 
-//    private val _videoTrack = MutableStateFlow<VideoTrack?>(null)
-//    val videoTrack = _videoTrack.asStateFlow()
-//
-//    private val _videoStatus = MutableStateFlow("Disconnected")
-//    val videoStatus = _videoStatus.asStateFlow()
-
     // --- MQTT Handling ---
     private val brokerHost = BuildConfig.MQTT_BROKER_HOST
     private val brokerPort = 8883
     private val mqttUsername = BuildConfig.MQTT_USERNAME
     private val mqttPassword = BuildConfig.MQTT_PASSWORD
-    private val signalingOutTopic = "rcboat/signaling/base_to_boat"
-    private val signalingInTopic = "rcboat/signaling/boat_to_base"
-    private val generalTopic = "rcboat/general"
     private var mqttClient: Mqtt5AsyncClient? = null
     private var commandPublishJob: Job? = null
 
     // --- Control State ---
     private var throttle = 0f
     private var steering = 0f
-
-    // --- WebRTC ---
-//    private val eglBase = EglBase.create()
-//    val eglBaseContext: EglBase.Context = eglBase.eglBaseContext
-//    private var controlDataChannel: DataChannel? = null
-//    private var telemetryDataChannel: DataChannel? = null
-    private var isDataChannelOpen = false
-
-//    private val peerConnectionFactory: PeerConnectionFactory by lazy {
-//        PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(application).createInitializationOptions())
-//        PeerConnectionFactory.builder()
-//            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
-//            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
-//            .createPeerConnectionFactory()
-//    }
-//    private var peerConnection: PeerConnection? = null
 
     fun connectMqtt() {
         _mqttStatus.value = "Connecting..."
@@ -129,17 +98,12 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             .addConnectedListener {
                 viewModelScope.launch {
                     _mqttStatus.value = "Connected"
-//                    subscribeToSignaling()
-                    // Proactively initiate the call as soon as we connect
-                    initiateWebRTC()
                 }
             }
             .addDisconnectedListener {
                 viewModelScope.launch {
                     _mqttStatus.value = "Disconnected"
-                    isDataChannelOpen = false
                     commandPublishJob?.cancel()
-//                    cleanupWebRTC()
                 }
             }
             .buildAsync()
@@ -157,6 +121,23 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                     }
                 }
             }
+
+        startCommandPublishing()
+        subscribeToTelemetry()
+    }
+
+    private fun subscribeToTelemetry() {
+        mqttClient?.subscribeWith()
+            ?.topicFilter("rcboat/telemetry/#")
+            ?.callback { publish ->
+                if (publish.payload.isPresent) {
+                    val message =  StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
+                    val topic = publish.topic.toString()
+                    Log.d(TAG, "Received message on topic '$topic': $message")
+                    updateTelemetry(topic, message)
+                }
+            }
+            ?.send()
     }
 
     private fun updateTelemetry(topic: String, payload: String) {
@@ -164,8 +145,8 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
             val currentData = _telemetryData.value
             _telemetryData.value = when {
                 topic.endsWith("voltage") -> currentData.copy(boatVoltage = "$payload V")
-                topic.endsWith("tacho") -> currentData.copy(boatTacho = "$payload RPM")
-                topic.endsWith("battery") -> currentData.copy(phoneBattery = "$payload%")
+                topic.endsWith("prop_rpm") -> currentData.copy(boatTacho = "$payload RPM")
+                topic.endsWith("battery") -> currentData.copy(phoneBattery = "$payload.%")
                 topic.endsWith("signal") -> currentData.copy(phoneSignal = "Level: $payload/4")
                 topic.endsWith("network_type") -> currentData.copy(phoneNetworkType = payload)
                 topic.endsWith("gps") -> currentData.copy(phoneGps = payload)
@@ -186,292 +167,37 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
                 val motorCommand = "M$power,$direction\n"
                 val rudderCommand = "R$angle\n"
 
-                mqttClient?.publishWith()?.topic("rcboat/command/motor_throttle")?.payload(motorCommand.toByteArray())?.send()
-                mqttClient?.publishWith()?.topic("rcboat/command/rudder_angle")?.payload(rudderCommand.toByteArray())?.send()
-//                sendDataChannelCommand(motorCommand)
-//                sendDataChannelCommand(rudderCommand)
+                mqttClient
+                    ?.publishWith()
+                    ?.topic("rcboat/command/motor_throttle")
+                    ?.payload(motorCommand.toByteArray())
+                    ?.qos(MqttQos.EXACTLY_ONCE)
+                    ?.retain(false)
+                    ?.send()
 
+
+                mqttClient
+                    ?.publishWith()
+                    ?.topic("rcboat/command/rudder_angle")
+                    ?.payload(rudderCommand.toByteArray())
+                    ?.qos(MqttQos.EXACTLY_ONCE)
+                    ?.retain(false)
+                    ?.send()
                 delay(200)
             }
         }
     }
 
-//    private fun sendDataChannelCommand(command: String) {
-//        if (isDataChannelOpen) {
-//            val buffer = ByteBuffer.wrap(command.toByteArray(StandardCharsets.UTF_8))
-//            controlDataChannel?.send(DataChannel.Buffer(buffer, false))
-//        }
-//    }
-
     fun updateThrottle(value: Float) { throttle = value }
     fun updateSteering(value: Float) { steering = value }
 
-//    private fun subscribeToSignaling() {
-//        mqttClient?.subscribeWith()
-//            ?.topicFilter(signalingInTopic)
-//            ?.callback { publish ->
-//                if (publish.payload.isPresent) {
-//                    val message = StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
-//                    Log.d("WebRTC_Signaling", "Received message: $message")
-//                    val json = JSONObject(message)
-//                    when {
-//                        json.has("sdp") -> {
-//                            val sdp = json.getString("sdp")
-//                            val type = SessionDescription.Type.fromCanonicalForm(json.getString("type").lowercase())
-//                            if (type == SessionDescription.Type.ANSWER) {
-//                                Log.d("WebRTC_Signaling", "Received ANSWER")
-//                                peerConnection?.setRemoteDescription(SdpObserverAdapter(), SessionDescription(type, sdp))
-//                            }
-//                        }
-//                        json.has("candidate") -> {
-//                            Log.d("WebRTC_Signaling", "Received ICE Candidate")
-//                            val candidate = IceCandidate(
-//                                json.getString("sdpMid"),
-//                                json.getInt("sdpMLineIndex"),
-//                                json.getString("candidate")
-//                            )
-//                            peerConnection?.addIceCandidate(candidate)
-//                        }
-//                    }
-//                }
-//            }
-//            ?.send()
-//    }
-
-//    private fun sendSignalingMessage(message: JSONObject) {
-//        Log.d("WebRTC_Signaling", "Sending message: $message")
-//        if (mqttClient?.state?.isConnected == true) {
-//            mqttClient?.publishWith()?.topic(signalingOutTopic)?.payload(message.toString().toByteArray())?.send()
-//        }
-//    }
-
-//    private fun sendGeneralMessage(message: JSONObject) {
-//        Log.d("MQTT_General_Message", "Sending message: $message")
-//        if (mqttClient?.state?.isConnected == true) {
-//            mqttClient?.publishWith()?.topic(generalTopic)?.payload(message.toString().toByteArray())?.send()
-//        }
-//    }
-
-    private fun initiateWebRTC() {
-
-        startCommandPublishing()
-//        if (peerConnection?.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
-//            cleanupWebRTC()
-//        }
-//
-//        val iceServers = listOf(
-//            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-//            PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478").createIceServer(),
-//            PeerConnection.IceServer.builder("turn:numb.viagenie.ca:3478")
-//                .setUsername("webrtc@live.com")
-//                .setPassword("muazkh")
-//                .createIceServer(),
-//            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
-//                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
-//                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
-//                .createIceServer(),
-//            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=tcp")
-//                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
-//                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
-//                .createIceServer(),
-//            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:443?transport=tcp")
-//                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
-//                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
-//                .createIceServer(),
-//            )
-//        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
-//            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-//        }
-//
-//        peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
-//            override fun onIceCandidate(candidate: IceCandidate?) {
-//                candidate?.let {
-//                    Log.d("WebRTC_Signaling", "Generated local ICE Candidate")
-//                    val json = JSONObject().apply {
-//                        put("candidate", it.sdp)
-//                        put("sdpMid", it.sdpMid)
-//                        put("sdpMLineIndex", it.sdpMLineIndex)
-//                    }
-//                    sendSignalingMessage(json)
-//                }
-//            }
-//            override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
-//                receiver?.track()?.let { track ->
-//                    if (track is VideoTrack) {
-//                        viewModelScope.launch(Dispatchers.Main) {
-//                            _videoTrack.value = track
-//                        }
-//                        _videoStatus.value = "Connected"
-//                    }
-//                }
-//            }
-//            override fun onDataChannel(dataChannel: DataChannel?) {
-//                telemetryDataChannel = dataChannel
-//                telemetryDataChannel?.registerObserver(object : DataChannel.Observer {
-//                    override fun onBufferedAmountChange(p0: Long) {}
-//                    override fun onStateChange() {}
-//                    override fun onMessage(buffer: DataChannel.Buffer?) {
-//                        buffer?.let {
-//                            val data = ByteArray(it.data.remaining())
-//                            it.data.get(data)
-//                            val message = String(data, StandardCharsets.UTF_8)
-//                            val parts = message.split(":", limit = 2)
-//                            if (parts.size == 2) {
-//                                updateTelemetry(parts[0], parts[1])
-//                            }
-//                        }
-//                    }
-//                })
-//            }
-//            override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
-//            override fun onIceConnectionChange(p0: PeerConnection.IceConnectionState?) {}
-//            override fun onIceConnectionReceivingChange(p0: Boolean) {}
-//            override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState?) {}
-//            override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
-//            override fun onAddStream(p0: MediaStream?) {}
-//            override fun onRemoveStream(p0: MediaStream?) {}
-//            override fun onRenegotiationNeeded() {}
-//        })
-//
-//        peerConnection?.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY))
-//
-//        controlDataChannel = peerConnection?.createDataChannel("control", DataChannel.Init())
-//        controlDataChannel?.registerObserver(object : DataChannel.Observer {
-//            override fun onBufferedAmountChange(p0: Long) {}
-//            override fun onStateChange() {
-//                if (controlDataChannel?.state() == DataChannel.State.OPEN) {
-//                    isDataChannelOpen = true
-//                    startCommandPublishing()
-//                } else {
-//                    isDataChannelOpen = false
-//                }
-//            }
-//            override fun onMessage(p0: DataChannel.Buffer?) {}
-//        })
-//
-//
-//        peerConnection?.createOffer(object: SdpObserverAdapter() {
-//            override fun onCreateSuccess(sdp: SessionDescription?) {
-//                peerConnection?.setLocalDescription(object: SdpObserverAdapter() {
-//                    override fun onSetSuccess() {
-//                        Log.d("WebRTC_Signaling", "Set local description (offer) success")
-//                        sdp?.let {
-//                            val json = JSONObject().apply {
-//                                put("type", it.type.canonicalForm())
-//                                put("sdp", it.description)
-//                            }
-//                            sendSignalingMessage(json)
-//                        }
-//                    }
-//                    override fun onSetFailure(error: String?) {
-//                        Log.e("WebRTC_Signaling", "Failed to set local description: $error")
-//                    }
-//                }, sdp)
-//            }
-//            override fun onCreateFailure(error: String?) {
-//                Log.e("WebRTC_Signaling", "Failed to create offer: $error")
-//            }
-//        }, MediaConstraints())
-    }
-
-//    private val cleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-//
-//    private fun cleanupWebRTC() {
-//        Log.d(TAG, "Performing actual WebRTC resource release on thread: ${Thread.currentThread().name}")
-//        try {
-//            controlDataChannel?.unregisterObserver()
-//            telemetryDataChannel?.unregisterObserver()
-//
-//            Log.d(TAG, "Closing control data channel...")
-//            controlDataChannel?.close()
-//            Log.d(TAG, "Closing telemetry data channel...")
-//            telemetryDataChannel?.close()
-//
-//            commandPublishJob?.cancel()
-//
-//            // Dispatch peerConnection.close() to a different thread
-//            val pc = peerConnection // Capture for use in coroutine
-//            if (pc != null) {
-//                Log.d(TAG, "Dispatching peerConnection.close() to background thread...")
-//                cleanupScope.launch { // Launch on IO dispatcher
-//                    try {
-//                        Log.d(TAG, "Attempting peerConnection.close() on thread: ${Thread.currentThread().name}")
-//                        pc.close()
-//                        Log.i(TAG, "Peer connection closed successfully (from background thread).")
-//                        // Proceed with nullifying and updating status from this background thread
-//                        // or post back to a main/handler thread if UI updates are needed directly from here.
-//                        // For now, let's assume further cleanup can happen here.
-//                        nullifyWebRTCResourcesAndSignal() // New method for post-close actions
-//
-//                    } catch (e: Exception) {
-//                        Log.e(TAG, "Error during peerConnection.close() in background thread", e)
-//                        // Still ensure cleanup finalization happens
-//                        nullifyWebRTCResourcesAndSignal()
-//                    }
-//                }
-//                // NOTE: The code after this launch block will execute immediately,
-//                // NOT waiting for pc.close() to finish. The 'finally' block below
-//                // needs to be rethought if pc.close() is async.
-//            } else {
-//                Log.d(TAG, "PeerConnection was already null before attempting close.")
-//                nullifyWebRTCResourcesAndSignal() // If pc was null, proceed to nullify and signal
-//            }
-//
-//            Log.d(TAG, "Peer connection closed.")
-//
-//
-//        } catch (e: Exception) {
-//            Log.e(TAG, "Error during initial WebRTC cleanup steps (before pc.close dispatch)", e)
-//            cleanupScope.launch { nullifyWebRTCResourcesAndSignal() }
-//        } finally {
-//            peerConnection = null
-//            controlDataChannel = null
-//            telemetryDataChannel = null
-//            isDataChannelOpen = false
-//            viewModelScope.launch(Dispatchers.Main) {
-//                _videoTrack.value = null
-//            }
-//
-//        }
-//    }
-
-//    private fun nullifyWebRTCResourcesAndSignal() {
-//        // This function should be called AFTER peerConnection.close() has completed or failed
-//        // Ensure this is thread-safe if called from different contexts, or dispatch to a consistent thread.
-//        // For simplicity, assuming it's called from the cleanupScope coroutine or after pc is confirmed null.
-//        Log.d(TAG, "Nullifying WebRTC resources and updating status on thread: ${Thread.currentThread().name}")
-//        peerConnection = null
-//        controlDataChannel = null
-//        telemetryDataChannel = null
-//        Log.i(TAG, "WebRTC cleanup complete (after nullification and status update).")
-//    }
-
     fun disconnectMqtt() {
-//        sendSignalingMessage(JSONObject().put("type", "bye"))
-//        cleanupWebRTC()
         mqttClient?.disconnect()
     }
-
-//    fun toggleVideoFeed() {
-//        val json = JSONObject().apply {
-//            put("video", if (_videoStatus.value == "Connected") "disable" else "enable")
-//        }
-//        sendGeneralMessage(json)
-//        if (_videoStatus.value == "Connected") {
-//            _videoStatus.value = "Disconnected"
-//            _videoTrack.value!!.setEnabled(false)
-//        } else {
-//            _videoStatus.value = "Connected"
-//            _videoTrack.value!!.setEnabled(true)
-//        }
-//
-//    }
 
 
     override fun onCleared() {
         disconnectMqtt()
-//        eglBase.release()
-//        peerConnectionFactory.dispose()
         super.onCleared()
     }
 
@@ -485,11 +211,8 @@ class BaseStationViewModel(application: Application) : AndroidViewModel(applicat
 fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
     val mqttStatus by viewModel.mqttStatus.collectAsState()
     val telemetryData by viewModel.telemetryData.collectAsState()
-//    val videoTrack by viewModel.videoTrack.collectAsState()
-//    val videoStatus by viewModel.videoStatus.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize()) {
-//        VideoView(videoTrack, viewModel.eglBaseContext, modifier = Modifier.fillMaxSize())
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -510,9 +233,6 @@ fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
                 }) {
                     Text(if (mqttStatus == "Connected") "Disconnect" else "Connect")
                 }
-//                Button(onClick = {viewModel.toggleVideoFeed()}){
-//                    Text(if (videoStatus == "Connected") "Disable Video" else "Enable Video")
-//                }
             }
             Text(
                 "MQTT Status: $mqttStatus",
@@ -533,35 +253,6 @@ fun BaseStationScreen(viewModel: BaseStationViewModel = viewModel()) {
         }
     }
 }
-
-// --- UI: Video View ---
-@Composable
-fun VideoView(videoTrack: VideoTrack?, eglBaseContext: EglBase.Context?, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val surfaceViewRenderer = remember { SurfaceViewRenderer(context) }
-
-    DisposableEffect(eglBaseContext) {
-        if (eglBaseContext != null) {
-            surfaceViewRenderer.init(eglBaseContext, null)
-            surfaceViewRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-            surfaceViewRenderer.setEnableHardwareScaler(true)
-            surfaceViewRenderer.setZOrderMediaOverlay(true)
-        }
-        onDispose {
-            surfaceViewRenderer.release()
-        }
-    }
-
-    DisposableEffect(videoTrack) {
-        videoTrack?.addSink(surfaceViewRenderer)
-        onDispose {
-            videoTrack?.removeSink(surfaceViewRenderer)
-        }
-    }
-
-    AndroidView({ surfaceViewRenderer }, modifier = modifier)
-}
-
 
 // --- Other UI Composables (TelemetryDashboard, Sliders, etc.)
 @Composable
@@ -685,12 +376,4 @@ fun BaseStationTheme(content: @Composable () -> Unit) {
         colorScheme = colorScheme,
         content = content
     )
-}
-
-// SdpObserver adapter to simplify callbacks
-open class SdpObserverAdapter : SdpObserver {
-    override fun onCreateSuccess(sdp: SessionDescription?) {}
-    override fun onSetSuccess() {}
-    override fun onCreateFailure(error: String?) {}
-    override fun onSetFailure(error: String?) {}
 }
